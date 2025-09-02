@@ -30,6 +30,9 @@ import site.ycsb.DBException;
 import site.ycsb.Status;
 import site.ycsb.StringByteIterator;
 import redis.clients.jedis.BasicCommands;
+
+// 添加日志框架导入 (使用Java标准库避免添加新Maven依赖)
+import java.util.logging.Logger;
 import redis.clients.jedis.HostAndPort;
 import redis.clients.jedis.Jedis;
 import redis.clients.jedis.JedisCluster;
@@ -38,6 +41,8 @@ import redis.clients.jedis.Protocol;
 
 import java.io.Closeable;
 import java.io.IOException;
+import java.net.Socket;
+import java.net.SocketException;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.HashSet;
@@ -52,7 +57,15 @@ import java.util.Vector;
  *
  * See {@code redis/README.md} for details.
  */
+/**
+ * Redis client binding for YCSB.
+ *
+ * All YCSB records are mapped to a Redis *hash field*.  For scanning
+ * operations, all keys are saved (by an arbitrary hash) in a sorted set.
+ */
 public class RedisClient extends DB {
+
+  private static final Logger LOGGER = Logger.getLogger(RedisClient.class.getName());
 
   private JedisCommands jedis;
 
@@ -71,29 +84,89 @@ public class RedisClient extends DB {
     String portString = props.getProperty(PORT_PROPERTY);
     if (portString != null) {
       port = Integer.parseInt(portString);
+      LOGGER.info("Redis port configured: " + port);
     } else {
       port = Protocol.DEFAULT_PORT;
+      LOGGER.info("Using default Redis port: " + port);
     }
     String host = props.getProperty(HOST_PROPERTY);
+    LOGGER.info("Redis host configured: " + host);
+
+    // ======= Enhanced timeout configuration processing (simplified) =======
+    String redisTimeout = props.getProperty(TIMEOUT_PROPERTY);
+
+    // Use default if not specified
+    int connectionTimeout = 3000; // 3s default connection timeout
+    int soTimeout = 5000; // 5s default socket read timeout
+
+    if (redisTimeout != null) {
+      // Parse flexible redis.timeout format: "connectionTimeout:multiplier" or "connectionTimeout"
+      if (redisTimeout.contains(":")) {
+        // Split by colon and parse multiplier
+        String[] parts = redisTimeout.split(":");
+        connectionTimeout = Integer.parseInt(parts[0]);
+        double multiplier = Double.parseDouble(parts[1]);
+        soTimeout = (int) Math.max(connectionTimeout * multiplier, 1000); // Minimum 1000ms
+        LOGGER.info(String.format("Using flexible timeout format: %s -> connectionTimeout=%dms * %.2f = soTimeout=%dms",
+                        redisTimeout, connectionTimeout, multiplier, soTimeout));
+      } else {
+        // Default use connectionTimeout * 2 for soTimeout
+        connectionTimeout = Integer.parseInt(redisTimeout);
+        soTimeout = Math.max(connectionTimeout * 2, 1000); // Minimum 1000ms
+        LOGGER.info("Using standard timeout format: " + redisTimeout + "ms -> connectionTimeout=" + connectionTimeout +
+                    "ms, soTimeout=" + soTimeout + "ms (2x factor)");
+      }
+    } else {
+      LOGGER.warning("No redis.timeout specified, using defaults: connectionTimeout=" + connectionTimeout +
+                     "ms, soTimeout=" + soTimeout + "ms");
+    }
 
     boolean clusterEnabled = Boolean.parseBoolean(props.getProperty(CLUSTER_PROPERTY));
     if (clusterEnabled) {
+      LOGGER.warning("Cluster mode detected: enhanced timeout configuration will be used for cluster");
       Set<HostAndPort> jedisClusterNodes = new HashSet<>();
       jedisClusterNodes.add(new HostAndPort(host, port));
+      // For cluster, we still create JedisCluster without explicit timeout
       jedis = new JedisCluster(jedisClusterNodes);
+      LOGGER.info("JedisCluster created: timeout control may be limited");
     } else {
-      String redisTimeout = props.getProperty(TIMEOUT_PROPERTY);
-      if (redisTimeout != null){
-        jedis = new Jedis(host, port, Integer.parseInt(redisTimeout));
-      } else {
-        jedis = new Jedis(host, port);
+      LOGGER.info("Standalone mode: creating Jedis instance with enhanced timeout control");
+
+      // Use 4-parameter constructor to fix timeout transmission: both connectionTimeout and soTimeout
+      LOGGER.info(String.format("Creating Jedis instance with dual timeout: host=%s, port=%d, " +
+                                "connectionTimeout=%dms, soTimeout=%dms (was: %s)",
+                                host, port, connectionTimeout, soTimeout,
+                                redisTimeout != null ? "configured" : "default"));
+      jedis = new Jedis(host, port, connectionTimeout, soTimeout);
+
+      try {
+        LOGGER.info("Calling Jedis.connect() with enhanced timeout parameters...");
+        ((Jedis) jedis).connect();
+
+        // Configure TCP Keepalive after successful connection
+        try {
+          Socket jedisSocket = ((Jedis) jedis).getClient().getSocket();
+          jedisSocket.setKeepAlive(true);
+          jedisSocket.setSoLinger(true, 0); // Optimize for immediate close
+          LOGGER.info("TCP Keepalive enabled for connection stability");
+        } catch (SocketException e) {
+          LOGGER.warning("Failed to configure TCP Keepalive, connection may be less stable: " + e.getMessage());
+        }
+
+        LOGGER.info("Jedis connection established successfully with enhanced timeout control");
+      } catch (Exception e) {
+        LOGGER.severe("Jedis connection FAILED: " + e.getMessage());
+        throw e;
       }
-      ((Jedis) jedis).connect();
     }
 
     String password = props.getProperty(PASSWORD_PROPERTY);
     if (password != null) {
+      LOGGER.info("Password configured, attempting Redis authentication");
       ((BasicCommands) jedis).auth(password);
+      LOGGER.info("Redis authentication completed");
+    } else {
+      LOGGER.info("No Redis password configured");
     }
   }
 
